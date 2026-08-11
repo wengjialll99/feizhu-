@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""大荔枝 watchdog - 检测守护进程是否存活，不存活则重启（单进程多群模式）"""
+"""大荔枝 watchdog - 检测守护进程是否存活，不存活则重启（单进程多群模式）
+附带自动 git pull：每 60 分钟拉取远程最新代码，有变更则重启 daemon。"""
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -13,6 +15,8 @@ DAEMON = os.path.join(SCRIPT_DIR, 'dd_bot_daemon.py')
 LOG_FILE = os.path.join(SCRIPT_DIR, '.dd_bot_watchdog.log')
 PID_FILE = os.path.join(SCRIPT_DIR, '.dd_bot.pid')
 STDOUT_LOG = os.path.join(SCRIPT_DIR, '.dd_bot_stdout.log')
+PULL_TS_FILE = os.path.join(SCRIPT_DIR, '.dd_bot_last_pull')
+PULL_INTERVAL = 3600  # 每 60 分钟自动拉取一次
 
 # ===== 群配置列表（新增群在这里加） =====
 GROUPS = [
@@ -46,7 +50,96 @@ def is_alive():
         return False
 
 
+def _kill_daemon():
+    """优雅终止 daemon 进程"""
+    if not os.path.isfile(PID_FILE):
+        return False
+    try:
+        with open(PID_FILE) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, signal.SIGTERM)
+        # 等几秒确认退出
+        for _ in range(10):
+            time.sleep(0.5)
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+        # 清理 pid 文件
+        for f in [PID_FILE, PID_FILE + '.lock']:
+            if os.path.isfile(f):
+                os.remove(f)
+        return True
+    except Exception:
+        return False
+
+
+def try_git_pull():
+    """定期从远程仓库拉取最新代码。如果有更新，杀掉 daemon 让下一轮重启。"""
+    # 检查距离上次 pull 是否已过 PULL_INTERVAL 秒
+    last_pull = 0.0
+    if os.path.isfile(PULL_TS_FILE):
+        try:
+            last_pull = float(open(PULL_TS_FILE).read().strip())
+        except (ValueError, OSError):
+            pass
+
+    if time.time() - last_pull < PULL_INTERVAL:
+        return  # 还没到时间
+
+    # 记录本次 pull 时间（无论成功与否，避免反复重试）
+    with open(PULL_TS_FILE, 'w') as f:
+        f.write(str(time.time()))
+
+    # 检查是否有 remote 配置
+    try:
+        r = subprocess.run(
+            ['git', 'remote'], capture_output=True, text=True,
+            cwd=SCRIPT_DIR, timeout=5,
+        )
+        if not r.stdout.strip():
+            return  # 没有 remote，跳过
+    except Exception:
+        return
+
+    # 执行 git pull
+    try:
+        r = subprocess.run(
+            ['git', 'pull', '--ff-only'],
+            capture_output=True, text=True,
+            cwd=SCRIPT_DIR, timeout=30,
+        )
+        output = (r.stdout or '') + (r.stderr or '')
+
+        if 'Already up to date' in output or 'Already up-to-date' in output:
+            log('git pull: 已是最新')
+            return
+
+        if r.returncode != 0:
+            log(f'git pull 失败: {output.strip()}')
+            return
+
+        # 有更新！
+        log(f'git pull 成功，检测到新代码，准备重启 daemon')
+
+        if is_alive():
+            if _kill_daemon():
+                log('已停止旧 daemon，下一轮 watchdog 将用新代码重启')
+            else:
+                log('停止旧 daemon 失败，可能需手动重启')
+        else:
+            log('daemon 未运行，下一轮 watchdog 将用新代码启动')
+
+    except subprocess.TimeoutExpired:
+        log('git pull 超时')
+    except Exception as e:
+        log(f'git pull 异常: {e}')
+
+
 def main():
+    # 先尝试自动拉取远程代码
+    try_git_pull()
+
     if is_alive():
         return
 

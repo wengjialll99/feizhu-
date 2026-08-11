@@ -4,6 +4,7 @@
 *.state*.json
 state_*.json
 .dd_bot_state*.json
+.dd_bot_last_pull
 
 # Logs
 *.log
