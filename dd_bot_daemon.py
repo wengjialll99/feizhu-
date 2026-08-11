@@ -532,6 +532,38 @@ def acquire_lock():
 _pending_followups = {}
 _FOLLOWUP_TIMEOUT = 300  # 追问有效期 5 分钟
 
+# ==================== 多轮对话记忆 ====================
+
+# 对话历史：{sender_id: [(question, answer, timestamp), ...]}，每人最多保留 3 轮
+_chat_history = {}
+_HISTORY_MAX_TURNS = 3
+_HISTORY_TIMEOUT = 600  # 10 分钟内有效
+
+
+def _add_history(sender_id, question, answer):
+    """记录一轮对话"""
+    if sender_id not in _chat_history:
+        _chat_history[sender_id] = []
+    _chat_history[sender_id].append((question, answer, time.time()))
+    # 只保留最近 N 轮
+    if len(_chat_history[sender_id]) > _HISTORY_MAX_TURNS:
+        _chat_history[sender_id] = _chat_history[sender_id][-_HISTORY_MAX_TURNS:]
+
+
+def _get_history_context(sender_id):
+    """获取最近对话历史作为上下文，避免重复并支持多轮"""
+    if sender_id not in _chat_history:
+        return ''
+    now = time.time()
+    recent = [(q, a) for q, a, ts in _chat_history[sender_id] if now - ts < _HISTORY_TIMEOUT]
+    if not recent:
+        return ''
+    lines = []
+    for i, (q, a) in enumerate(recent, 1):
+        lines.append(f'第{i}轮 - 用户问：{q[:100]}')
+        lines.append(f'你答：{a[:200]}')
+    return '之前的对话记录（不要重复说过的内容）：\n' + '\n'.join(lines)
+
 
 def _check_followup(sender_id, msg_text):
     """检查消息是否是追问的回复。返回 (original_q, followup_q, reply_text) 或 None。"""
@@ -646,7 +678,12 @@ def handle_message(msg, group_cfg):
         # 新问题
         log(f'[{sender_name}] {question[:80]}{"..." if len(question) > 80 else ""}')
         t0 = time.time()
-        answer, need_more, aerr = rag_answer(question,
+
+        # 构建多轮对话上下文
+        history_ctx = _get_history_context(sender_id)
+        extra = history_ctx
+
+        answer, need_more, aerr = rag_answer(question, extra_context=extra,
                                              notebook_id=g_notebook_id, system_prompt=g_system_prompt)
 
         if aerr or not answer:
@@ -656,6 +693,7 @@ def handle_message(msg, group_cfg):
             _set_followup(sender_id, question, answer)
             reply = f'@{sender_name}\n\n{clean_markdown(answer)}'
             log(f'  条件不足，已追问')
+            _add_history(sender_id, question, answer)
         else:
             sources, _ = retrieve_sources(question, notebook_id=g_notebook_id)
             empty = False if g_casual else is_no_result(answer, sources)
@@ -665,6 +703,7 @@ def handle_message(msg, group_cfg):
             else:
                 elapsed = time.time() - t0
                 log(f'  回答成功 ({elapsed:.1f}s)')
+            _add_history(sender_id, question, answer)
 
     # 发送回复
     ok, serr = send_reply(group_cfg, reply)
