@@ -58,8 +58,6 @@ GROUP_ID = GROUPS[0]['group_id'] if GROUPS else ''
 # 自己的 openDingTalkId（黎之），用于过滤自己发的消息
 MY_ID = os.environ.get('DD_MY_ID', 'D8xogtFABiSSTrd6EuHJzT9wLSbrcuEtTW')
 
-# 自己的钉钉显示名，用于检测 @我
-MY_NAME = os.environ.get('DD_MY_NAME', '黎之')
 
 # 兜底联系人：搜不到答案时 @这些人（逗号分隔，如 "黎之,燕麦"）
 FALLBACK_CONTACTS = os.environ.get('DD_FALLBACK_CONTACTS', '黎之').split(',')
@@ -83,7 +81,39 @@ STATE_FILE = os.path.join(_SCRIPT_DIR, '.dd_bot_state.json')
 PID_FILE = os.path.join(_SCRIPT_DIR, '.dd_bot.pid')
 
 # 已知机器人名称（过滤机器人回复，只保留真人提问）
-KNOWN_BOTS = {'AI小钉', '大荔枝', '小助手'}
+KNOWN_BOTS = {'AI小钉', '大荔枝', '小助手', '与时'}
+
+# ---- 海底捞事件 bot 人设 ----
+_HAIDILAO_SYSTEM = (
+    '你是「海底捞照片事件」复盘助手，掌握一个4人好友群（与时/三只/家乐/若含）的真实闹剧全资料（2026年8月7-10日）。\n'
+    '回答规则：\n'
+    '1. 事实与推断分开，已确认事实（真去吃了、真两个人、第一张是旧图、时间被改过）和属于心理推断的内容要明确区分\n'
+    '2. 能引原话就引原话，别自己编台词\n'
+    '3. 别把与时写成十恶不赦，他守的是面子不是骗钱骗感情\n'
+    '4. 回答简洁直接，控制在 400 字以内\n'
+    '5. 当用户说「扮演与时」「你来演与时」「跟与时对线」时，切换为角色扮演模式：'
+    '平静、油盐不进、永远有下一个解释、被逼到墙角就装死已读不回\n'
+    '6. 人物关系：与时=发照片的人（被告）；三只=翁家乐/穆春宇=较真的侦探；'
+    '家乐=翁家乐/黎之=反复横跳的墙头草；若含=吃瓜递刀'
+)
+
+HAIDILAO_KEYWORDS = [
+    '海底捞', '与时', '照片', '旧图', '摆盘', '赌局', '请客',
+    '三只', '家乐', '若含', '黎之', '穆春宇', 'sunrise', '雨石',
+    'C区健身', '人走茶凉', '铁证', '时间线', '第一幕', '第二幕', '第三幕',
+    '小票', '账单', '笔记本', '猪肚鸡', '番茄锅', '大悦城',
+    '扮演', '对线', '角色扮演', '复盘', '罗生门',
+    '为什么', '怎么回事', '发生了什么', '谁说的', '怎么回事',
+    '？', '?',
+]
+
+# ---- 预设档案：群配置可用 profile 字段引用 ----
+PROFILES = {
+    'haidilao': {
+        'system_prompt': _HAIDILAO_SYSTEM,
+        'trigger_keywords': HAIDILAO_KEYWORDS,
+    },
+}
 
 # 触发关键词（消息包含任一关键词才触发回答）
 TRIGGER_KEYWORDS = [
@@ -193,13 +223,13 @@ def _webhook_sign(secret):
     return f'&timestamp={timestamp}&sign={sign}'
 
 
-def send_via_webhook(url, secret, text):
+def send_via_webhook(url, secret, text, title='大荔枝'):
     """通过 webhook 机器人发送 markdown 消息"""
     full_url = url + _webhook_sign(secret)
     payload = json.dumps({
         'msgtype': 'markdown',
         'markdown': {
-            'title': '大荔枝',
+            'title': title,
             'text': text,
         },
     }).encode('utf-8')
@@ -221,8 +251,9 @@ def send_reply(group_cfg, text):
     """发送回复（优先 webhook，fallback 到用户身份）"""
     wh_url = group_cfg.get('webhook_url', '')
     wh_secret = group_cfg.get('webhook_secret', '')
+    bot_name = group_cfg.get('bot_name', '大荔枝')
     if wh_url:
-        ok, err = send_via_webhook(wh_url, wh_secret, text)
+        ok, err = send_via_webhook(wh_url, wh_secret, text, title=bot_name)
         if ok:
             return True, None
         log(f'  Webhook 发送失败 ({err})，降级为用户身份发送')
@@ -256,14 +287,17 @@ _RAG_SYSTEM = (
 )
 
 
-def rag_answer(question, extra_context=''):
-    """调用 QMind RAG 生成回答，支持追问模式"""
+def rag_answer(question, extra_context='', notebook_id=None, system_prompt=None):
+    """调用 QMind RAG 生成回答，支持追问模式。
+    notebook_id / system_prompt: 群级覆盖，不传则用全局默认值。"""
+    nb = notebook_id or NOTEBOOK_ID
+    sys_prompt = system_prompt or _RAG_SYSTEM
     full_q = question
     if extra_context:
         full_q = f'背景信息：{extra_context}\n问题：{question}'
-    prompt = f'{_RAG_SYSTEM}\n\n{full_q}'
+    prompt = f'{sys_prompt}\n\n{full_q}'
     out, err = run_qmind([
-        'rag', '-nb', NOTEBOOK_ID,
+        'rag', '-nb', nb,
         '-q', prompt, '-format', 'text',
     ], timeout=120)
     if err:
@@ -276,10 +310,11 @@ def rag_answer(question, extra_context=''):
     return out, need_more, None
 
 
-def retrieve_sources(question):
-    """获取参考来源"""
+def retrieve_sources(question, notebook_id=None):
+    """获取参考来源。notebook_id: 群级覆盖，不传则用全局默认值。"""
+    nb = notebook_id or NOTEBOOK_ID
     out, err = run_qmind([
-        'retrieve', '-nb', NOTEBOOK_ID,
+        'retrieve', '-nb', nb,
         '-q', question, '-format', 'json',
     ])
     if err:
@@ -302,25 +337,24 @@ def retrieve_sources(question):
 # ==================== 消息过滤 ====================
 
 def is_mentioned(text, bot_name=''):
-    """检查消息是否 @了我或 @了机器人（兼容 @黎之 和 @翁家乐(黎之) 两种格式）"""
+    """检查消息是否 @了机器人"""
     import re
-    if re.search(r'@\S*' + re.escape(MY_NAME), text):
-        return True
     if bot_name and re.search(r'@\S*' + re.escape(bot_name), text):
         return True
     return False
 
 
-def is_question(text):
-    """判断消息是否包含触发关键词"""
-    return any(kw in text for kw in TRIGGER_KEYWORDS)
+def is_question(text, trigger_keywords=None):
+    """判断消息是否包含触发关键词。trigger_keywords: 群级覆盖。"""
+    kws = trigger_keywords or TRIGGER_KEYWORDS
+    return any(kw in text for kw in kws)
 
 
-def should_trigger(text, bot_name=''):
+def should_trigger(text, bot_name='', trigger_keywords=None):
     """触发条件：@我 + 包含关键词"""
     if not is_mentioned(text, bot_name):
         return False
-    if is_question(text):
+    if is_question(text, trigger_keywords=trigger_keywords):
         return True
     return False
 
@@ -487,6 +521,13 @@ def handle_message(msg, group_cfg):
     content = msg.get('content', '')
     bot_name = group_cfg.get('bot_name', '')
 
+    # Per-group 配置覆盖（支持 profile 快捷引用）
+    profile_name = group_cfg.get('profile')
+    profile_cfg = PROFILES.get(profile_name, {}) if profile_name else {}
+    g_notebook_id = group_cfg.get('notebook_id')
+    g_system_prompt = group_cfg.get('system_prompt') or profile_cfg.get('system_prompt')
+    g_trigger_keywords = group_cfg.get('trigger_keywords') or profile_cfg.get('trigger_keywords')
+
     clean = content.strip()
 
     # 跳过自己发的机器人回复
@@ -507,14 +548,14 @@ def handle_message(msg, group_cfg):
     mentions_other = any(f'@{b}' in clean for b in other_bots)
 
     fu_state = _check_followup(sender_id, clean)
-    is_followup_reply = fu_state is not None and not should_trigger(clean, bot_name) and not mentions_other
+    is_followup_reply = fu_state is not None and not should_trigger(clean, bot_name, g_trigger_keywords) and not mentions_other
 
     if mentions_other and fu_state is not None:
         # 用户在跟别的机器人说话，清除追问状态
         _clear_followup(sender_id)
 
     # 跳过不包含 @我+关键词 且不是追问回复的消息
-    if not should_trigger(clean, bot_name) and not is_followup_reply:
+    if not should_trigger(clean, bot_name, g_trigger_keywords) and not is_followup_reply:
         return msg_id
 
     # ---- 处理问题 ----
@@ -525,7 +566,8 @@ def handle_message(msg, group_cfg):
         extra = f"原问题：{fu_state['original_q']}\n你的追问：{fu_state['followup_q']}\n用户回答：{question}"
         log(f'[{sender_name}] 追问回复: {question[:60]}')
         t0 = time.time()
-        answer, need_more, aerr = rag_answer(question, extra_context=extra)
+        answer, need_more, aerr = rag_answer(question, extra_context=extra,
+                                             notebook_id=g_notebook_id, system_prompt=g_system_prompt)
         _clear_followup(sender_id)
 
         if aerr or not answer:
@@ -537,7 +579,7 @@ def handle_message(msg, group_cfg):
             reply = f'@{sender_name}\n\n{clean_markdown(answer)}'
             log(f'  继续追问 (第{fu_state["turn"]+1}轮)')
         else:
-            sources, _ = retrieve_sources(question)
+            sources, _ = retrieve_sources(question, notebook_id=g_notebook_id)
             empty = is_no_result(answer, sources)
             if empty:
                 # 追问回答无有效结果，静默跳过
@@ -550,7 +592,8 @@ def handle_message(msg, group_cfg):
         # 新问题
         log(f'[{sender_name}] {question[:80]}{"..." if len(question) > 80 else ""}')
         t0 = time.time()
-        answer, need_more, aerr = rag_answer(question)
+        answer, need_more, aerr = rag_answer(question,
+                                             notebook_id=g_notebook_id, system_prompt=g_system_prompt)
 
         if aerr or not answer:
             reply = format_reply(sender_name, None, [], is_empty=True)
@@ -560,7 +603,7 @@ def handle_message(msg, group_cfg):
             reply = f'@{sender_name}\n\n{clean_markdown(answer)}'
             log(f'  条件不足，已追问')
         else:
-            sources, _ = retrieve_sources(question)
+            sources, _ = retrieve_sources(question, notebook_id=g_notebook_id)
             empty = is_no_result(answer, sources)
             reply = format_reply(sender_name, answer, sources, is_empty=empty)
             if empty:
@@ -593,8 +636,10 @@ def main():
     for g in GROUPS:
         tag = g.get('tag', g['group_id'][:8])
         wh = 'webhook' if g.get('webhook_url') else '用户身份'
-        log(f'  [{tag}] {g["group_id"][:20]}... ({wh})')
-    log(f'触发:    @{MY_NAME} + 关键词')
+        bot = g.get('bot_name', '?')
+        prof = f' profile={g["profile"]}' if g.get('profile') else ''
+        log(f'  [{tag}] {bot} | {g["group_id"][:20]}... ({wh}){prof}')
+    log(f'触发:    @机器人 + 关键词')
     log(f'间隔:    {INTERVAL}s × {len(GROUPS)}群')
     log(f'QMind:   {QMIND_BIN}')
     log('=' * 50)
@@ -648,6 +693,9 @@ def main():
                     last_time = gs['last_time']
                     answered = gs['answered']
                     bot_name = g.get('bot_name', '')
+                    # Resolve per-group profile for quick filter
+                    _prof = PROFILES.get(g.get('profile', ''), {}) if g.get('profile') else {}
+                    _trig_kws = g.get('trigger_keywords') or _prof.get('trigger_keywords')
 
                     messages, next_cursor, err = pull_messages(gid, last_time, limit=10)
                     if err:
@@ -684,7 +732,7 @@ def main():
                             skip = True
                         elif len(clean) < 4:
                             skip = True
-                        elif not should_trigger(clean, bot_name) and _check_followup(sender_id, clean) is None:
+                        elif not should_trigger(clean, bot_name, _trig_kws) and _check_followup(sender_id, clean) is None:
                             skip = True
 
                         if skip:

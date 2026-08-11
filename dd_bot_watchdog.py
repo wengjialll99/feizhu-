@@ -21,13 +21,22 @@ PULL_INTERVAL = 3600  # 每 60 分钟自动拉取一次
 # ===== 群配置列表（新增群在这里加） =====
 GROUPS = [
     {'tag': 'renzouchaliang', 'group_id': 'cidWuXsSf6NK/IyES4I61CAGw==', 'bot_name': '大荔枝'},
-    {'tag': 'chuangxin',     'group_id': 'cidLiCKX7xtseTamYRHphUBRA=='},
+    {'tag': 'chuangxin',     'group_id': 'cidLiCKX7xtseTamYRHphUBRA==', 'bot_name': '大荔枝'},
     {
         'tag': 'yiqinuli',
         'group_id': 'cidPa+hSdOllKJlF33qVol49w==',
         'bot_name': '大荔枝',
         'webhook_url': 'https://oapi.dingtalk.com/robot/send?access_token=a4ff77b10d8fd30bd135049a7fc6ef2f99378189a6d381a9492a60194d491f9f',
         'webhook_secret': 'SEC096b94d62108b2646f7c3808176fcca6385c57075577a3d94cc418b6bebff280',
+    },
+    {
+        'tag': 'haidilao',
+        'group_id': 'cidWuXsSf6NK/IyES4I61CAGw==',
+        'bot_name': '与时',
+        'profile': 'haidilao',
+        'notebook_id': '019fefa1-d4ab-75af-8950-7c69d310682a',
+        'webhook_url': 'https://oapi.dingtalk.com/robot/send?access_token=754d6d615403a77721eac8b91240dda159827ea583bfaebdf604695bd3023c8e',
+        'webhook_secret': 'SECb82fe6efbeb85725a945e71dc302d767883cc5056e0fb18d3f2d44e2479c4983',
     },
 ]
 
