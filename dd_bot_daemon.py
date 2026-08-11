@@ -81,20 +81,28 @@ STATE_FILE = os.path.join(_SCRIPT_DIR, '.dd_bot_state.json')
 PID_FILE = os.path.join(_SCRIPT_DIR, '.dd_bot.pid')
 
 # 已知机器人名称（过滤机器人回复，只保留真人提问）
-KNOWN_BOTS = {'AI小钉', '大荔枝', '小助手', '与时'}
+KNOWN_BOTS = {'AI小钉', '大荔枝', '小助手', '与时', '与时（海底捞版）', '转人工率推送'}
 
 # ---- 海底捞事件 bot 人设 ----
 _HAIDILAO_SYSTEM = (
-    '你是「海底捞照片事件」复盘助手，掌握一个4人好友群（与时/三只/家乐/若含）的真实闹剧全资料（2026年8月7-10日）。\n'
-    '回答规则：\n'
-    '1. 事实与推断分开，已确认事实（真去吃了、真两个人、第一张是旧图、时间被改过）和属于心理推断的内容要明确区分\n'
-    '2. 能引原话就引原话，别自己编台词\n'
-    '3. 别把与时写成十恶不赦，他守的是面子不是骗钱骗感情\n'
-    '4. 回答简洁直接，控制在 400 字以内\n'
-    '5. 当用户说「扮演与时」「你来演与时」「跟与时对线」时，切换为角色扮演模式：'
-    '平静、油盐不进、永远有下一个解释、被逼到墙角就装死已读不回\n'
-    '6. 人物关系：与时=发照片的人（被告）；三只=翁家乐/穆春宇=较真的侦探；'
-    '家乐=翁家乐/黎之=反复横跳的墙头草；若含=吃瓜递刀'
+    '你是「海底捞照片事件」复盘助手，同时可以扮演当事人「与时」。\n'
+    '你掌握这个4人好友群（与时/三只/家乐/若含）2026年8月7-10日闹剧的全部资料。\n\n'
+    '核心规则：\n'
+    '1. 永远不要说"我没有相关知识""找不到相关信息"之类的话。你是这个事件的亲历者和专家，'
+    '即使资料里没有直接答案，也要根据已知信息合理推断、自由发挥回答\n'
+    '2. 语气像朋友在群里聊天，自然随意口语化，绝对不要用结构化格式（不要标题、编号、分点、加粗）\n'
+    '3. 回答简洁，控制在 300 字以内\n'
+    '4. 事实与推断要自然地区分，不要像写报告一样标注\n'
+    '5. 能引原话就引原话，别编台词\n'
+    '6. 别把与时写成十恶不赦，他守的是面子不是骗钱骗感情\n\n'
+    '角色扮演模式（用户说「扮演与时」「你来演与时」「跟与时对线」时触发）：\n'
+    '直接变成与时本人，第一人称说话。与时的人设：\n'
+    '- 平静、云淡风轻、永远有下一个解释\n'
+    '- 被抓到矛盾就轻描淡写带过，绝不自乱阵脚\n'
+    '- 被逼到墙角就装死、已读不回、转移话题\n'
+    '- 口头禅风格：「这不是很正常吗」「你想多了」「我懒得跟你解释」\n\n'
+    '人物关系：与时=发照片的当事人；三只=翁家乐/穆春宇=较真的侦探；'
+    '家乐=反复横跳的墙头草；若含=吃瓜递刀看热闹'
 )
 
 HAIDILAO_KEYWORDS = [
@@ -112,6 +120,8 @@ PROFILES = {
     'haidilao': {
         'system_prompt': _HAIDILAO_SYSTEM,
         'trigger_keywords': HAIDILAO_KEYWORDS,
+        'trigger_any': True,  # @就回，不需要关键词
+        'casual_reply': True,  # 聊天风格回复，不加结论/来源
     },
 }
 
@@ -336,11 +346,13 @@ def retrieve_sources(question, notebook_id=None):
 
 # ==================== 消息过滤 ====================
 
-def is_mentioned(text, bot_name=''):
-    """检查消息是否 @了机器人"""
+def is_mentioned(text, bot_name='', bot_aliases=None):
+    """检查消息是否 @了机器人（支持别名）"""
     import re
-    if bot_name and re.search(r'@\S*' + re.escape(bot_name), text):
-        return True
+    names = [bot_name] + (bot_aliases or [])
+    for name in names:
+        if name and re.search(r'@\S*' + re.escape(name), text):
+            return True
     return False
 
 
@@ -350,10 +362,12 @@ def is_question(text, trigger_keywords=None):
     return any(kw in text for kw in kws)
 
 
-def should_trigger(text, bot_name='', trigger_keywords=None):
-    """触发条件：@我 + 包含关键词"""
-    if not is_mentioned(text, bot_name):
+def should_trigger(text, bot_name='', trigger_keywords=None, trigger_any=False, bot_aliases=None):
+    """触发条件：@我 + 包含关键词（或 trigger_any=True 时仅 @我即可）"""
+    if not is_mentioned(text, bot_name, bot_aliases):
         return False
+    if trigger_any:
+        return True
     if is_question(text, trigger_keywords=trigger_keywords):
         return True
     return False
@@ -410,15 +424,19 @@ def clean_markdown(text):
     return text.strip()
 
 
-def format_reply(sender_name, answer, sources, is_empty):
-    """格式化回复：结论 + 正文 + 分隔线 + 来源"""
+def format_reply(sender_name, answer, sources, is_empty, casual=False):
+    """格式化回复。casual=True 时用聊天风格，不加结论/来源。"""
     if is_empty:
+        if casual:
+            return f'@{sender_name}\n\n这个问题我还真不太清楚哈哈，你直接问当事人吧'
         fallback = ' '.join(f'@{c}' for c in FALLBACK_CONTACTS)
         return (
             f'@{sender_name}\n\n'
             f'💡 抱歉，这个问题我暂时没有找到对应的知识~\n'
             f'可以咨询 {fallback} 获取帮助。'
         )
+    elif casual:
+        return f'@{sender_name}\n\n{clean_markdown(answer)}'
     else:
         parts = [f'@{sender_name}', '', '## 结论', '', clean_markdown(answer)]
         if sources:
@@ -527,6 +545,9 @@ def handle_message(msg, group_cfg):
     g_notebook_id = group_cfg.get('notebook_id')
     g_system_prompt = group_cfg.get('system_prompt') or profile_cfg.get('system_prompt')
     g_trigger_keywords = group_cfg.get('trigger_keywords') or profile_cfg.get('trigger_keywords')
+    g_trigger_any = group_cfg.get('trigger_any') or profile_cfg.get('trigger_any', False)
+    g_casual = group_cfg.get('casual_reply') or profile_cfg.get('casual_reply', False)
+    g_aliases = group_cfg.get('bot_aliases', [])
 
     clean = content.strip()
 
@@ -548,14 +569,14 @@ def handle_message(msg, group_cfg):
     mentions_other = any(f'@{b}' in clean for b in other_bots)
 
     fu_state = _check_followup(sender_id, clean)
-    is_followup_reply = fu_state is not None and not should_trigger(clean, bot_name, g_trigger_keywords) and not mentions_other
+    is_followup_reply = fu_state is not None and not should_trigger(clean, bot_name, g_trigger_keywords, g_trigger_any, g_aliases) and not mentions_other
 
     if mentions_other and fu_state is not None:
         # 用户在跟别的机器人说话，清除追问状态
         _clear_followup(sender_id)
 
     # 跳过不包含 @我+关键词 且不是追问回复的消息
-    if not should_trigger(clean, bot_name, g_trigger_keywords) and not is_followup_reply:
+    if not should_trigger(clean, bot_name, g_trigger_keywords, g_trigger_any, g_aliases) and not is_followup_reply:
         return msg_id
 
     # ---- 处理问题 ----
@@ -585,7 +606,7 @@ def handle_message(msg, group_cfg):
                 # 追问回答无有效结果，静默跳过
                 log(f'  追问无有效结果，静默跳过')
                 return msg_id
-            reply = format_reply(sender_name, answer, sources, is_empty=False)
+            reply = format_reply(sender_name, answer, sources, is_empty=False, casual=g_casual)
             elapsed = time.time() - t0
             log(f'  追问回答成功 ({elapsed:.1f}s)')
     else:
@@ -596,7 +617,7 @@ def handle_message(msg, group_cfg):
                                              notebook_id=g_notebook_id, system_prompt=g_system_prompt)
 
         if aerr or not answer:
-            reply = format_reply(sender_name, None, [], is_empty=True)
+            reply = format_reply(sender_name, None, [], is_empty=True, casual=g_casual)
             log(f'  回答失败: {aerr}')
         elif need_more:
             _set_followup(sender_id, question, answer)
@@ -604,8 +625,8 @@ def handle_message(msg, group_cfg):
             log(f'  条件不足，已追问')
         else:
             sources, _ = retrieve_sources(question, notebook_id=g_notebook_id)
-            empty = is_no_result(answer, sources)
-            reply = format_reply(sender_name, answer, sources, is_empty=empty)
+            empty = False if g_casual else is_no_result(answer, sources)
+            reply = format_reply(sender_name, answer, sources, is_empty=empty, casual=g_casual)
             if empty:
                 log(f'  未搜到有效结果，已兜底')
             else:
@@ -644,26 +665,26 @@ def main():
     log(f'QMind:   {QMIND_BIN}')
     log('=' * 50)
 
-    # 加载状态（per-group）
+    # 加载状态（per-tag，每个 bot 独立状态）
     state = load_state() or {}
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    group_states = {}  # group_id -> {last_time, answered}
+    group_states = {}  # tag -> {last_time, answered}
     for g in GROUPS:
-        gid = g['group_id']
-        gs = state.get(gid)
+        tag = g.get('tag', g['group_id'][:8])
+        gs = state.get(tag) or state.get(g['group_id'])  # 兼容旧格式
         if gs:
-            group_states[gid] = {
+            group_states[tag] = {
                 'last_time': gs.get('last_time', now_str),
                 'answered': set(gs.get('answered_ids', [])),
             }
-            log(f'[{g.get("tag","")}] 恢复: 上次 {gs.get("last_time","?")}, 已回复 {len(gs.get("answered_ids",[]))} 条')
+            log(f'[{tag}] 恢复: 上次 {gs.get("last_time","?")}, 已回复 {len(gs.get("answered_ids",[]))} 条')
         else:
-            group_states[gid] = {'last_time': now_str, 'answered': set()}
-            log(f'[{g.get("tag","")}] 首次监听')
+            group_states[tag] = {'last_time': now_str, 'answered': set()}
+            log(f'[{tag}] 首次监听')
 
-    consecutive_errors = {g['group_id']: 0 for g in GROUPS}
+    consecutive_errors = {g.get('tag', g['group_id'][:8]): 0 for g in GROUPS}
     executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix='handler')
-    pending = {}  # future -> (msg_id, group_id)
+    pending = {}  # future -> (msg_id, tag)
 
     def _collect_done():
         """回收已完成的 future，更新对应群的 answered set。"""
@@ -672,9 +693,9 @@ def main():
                 try:
                     result_id = fut.result()
                     if result_id:
-                        gid = pending[fut][1]
+                        tag = pending[fut][1]
                         with _answered_lock:
-                            group_states[gid]['answered'].add(result_id)
+                            group_states[tag]['answered'].add(result_id)
                 except Exception as e:
                     log(f'  处理异常: {e}')
                 del pending[fut]
@@ -689,24 +710,26 @@ def main():
                 for g in GROUPS:
                     gid = g['group_id']
                     tag = g.get('tag', gid[:8])
-                    gs = group_states[gid]
+                    gs = group_states[tag]
                     last_time = gs['last_time']
                     answered = gs['answered']
                     bot_name = g.get('bot_name', '')
                     # Resolve per-group profile for quick filter
                     _prof = PROFILES.get(g.get('profile', ''), {}) if g.get('profile') else {}
                     _trig_kws = g.get('trigger_keywords') or _prof.get('trigger_keywords')
+                    _trig_any = g.get('trigger_any') or _prof.get('trigger_any', False)
+                    _aliases = g.get('bot_aliases', [])
 
-                    messages, next_cursor, err = pull_messages(gid, last_time, limit=10)
+                    messages, next_cursor, err = pull_messages(gid, last_time, limit=50)
                     if err:
-                        consecutive_errors[gid] += 1
-                        if consecutive_errors[gid] <= 2:
+                        consecutive_errors[tag] += 1
+                        if consecutive_errors[tag] <= 2:
                             log(f'[{tag}] 拉取失败: {err}')
-                        if consecutive_errors[gid] >= 5:
-                            log(f'[{tag}] 连续错误 {consecutive_errors[gid]}，跳过本轮')
+                        if consecutive_errors[tag] >= 5:
+                            log(f'[{tag}] 连续错误 {consecutive_errors[tag]}，跳过本轮')
                         continue
 
-                    consecutive_errors[gid] = 0
+                    consecutive_errors[tag] = 0
                     if not messages:
                         continue
 
@@ -732,7 +755,7 @@ def main():
                             skip = True
                         elif len(clean) < 4:
                             skip = True
-                        elif not should_trigger(clean, bot_name, _trig_kws) and _check_followup(sender_id, clean) is None:
+                        elif not should_trigger(clean, bot_name, _trig_kws, _trig_any, _aliases) and _check_followup(sender_id, clean) is None:
                             skip = True
 
                         if skip:
@@ -744,7 +767,7 @@ def main():
                         with _answered_lock:
                             answered.add(msg_id)
                         fut = executor.submit(handle_message, msg, g)
-                        pending[fut] = (msg_id, gid)
+                        pending[fut] = (msg_id, tag)
 
                     # 更新该群的时间戳
                     new_last_time = messages[-1].get('createTime', last_time)
@@ -761,12 +784,12 @@ def main():
                 # 持久化所有群的状态
                 save_data = {}
                 for g in GROUPS:
-                    gid = g['group_id']
-                    gs = group_states[gid]
+                    tag = g.get('tag', g['group_id'][:8])
+                    gs = group_states[tag]
                     ans = gs['answered']
                     if len(ans) > 500:
                         gs['answered'] = set(list(ans)[-300:])
-                    save_data[gid] = {
+                    save_data[tag] = {
                         'last_time': gs['last_time'],
                         'answered_ids': list(gs['answered']),
                     }
@@ -788,9 +811,9 @@ def main():
         # 最终持久化
         save_data = {}
         for g in GROUPS:
-            gid = g['group_id']
-            gs = group_states[gid]
-            save_data[gid] = {
+            tag = g.get('tag', g['group_id'][:8])
+            gs = group_states[tag]
+            save_data[tag] = {
                 'last_time': gs['last_time'],
                 'answered_ids': list(gs['answered']),
             }
