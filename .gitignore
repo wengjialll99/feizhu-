@@ -1,0 +1,20 @@
+# Runtime state
+*.pid
+*.pid.lock
+*.state*.json
+state_*.json
+.dd_bot_state*.json
+
+# Logs
+*.log
+logs/
+
+# Backup files
+*.bak
+
+# OS files
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc

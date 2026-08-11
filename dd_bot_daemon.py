@@ -1,0 +1,756 @@
+#!/usr/bin/env python3
+"""
+大荔枝 - 钉钉群机器人轮询脚本
+================================
+自动监听钉钉群消息，对提问调用 QMind RAG 生成回答，再发回群里。
+
+用法:
+  python3 dd_bot_daemon.py                        # 默认配置运行
+  DD_GROUP_ID=cidXXX python3 dd_bot_daemon.py     # 指定群
+  DD_INTERVAL=10 python3 dd_bot_daemon.py          # 自定义轮询间隔
+
+可选: 配置 Webhook 机器人发送（需先在群设置中添加自定义机器人）
+  DD_WEBHOOK_URL=https://oapi.dingtalk.com/robot/send?access_token=XXX
+  DD_WEBHOOK_SECRET=SECxxx  (加签模式)
+"""
+
+import json
+import subprocess
+import time
+import os
+import sys
+import hmac
+import hashlib
+import base64
+import re
+import urllib.parse
+import urllib.request
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
+
+# ==================== 配置 ====================
+
+def _load_groups():
+    """加载群配置列表。优先从 DD_GROUPS (JSON) 读取，fallback 到单群 DD_GROUP_ID。"""
+    raw = os.environ.get('DD_GROUPS', '')
+    if raw:
+        try:
+            groups = json.loads(raw)
+            if isinstance(groups, list) and groups:
+                return groups
+        except json.JSONDecodeError:
+            pass
+    # fallback: 单群模式
+    return [{
+        'tag': os.environ.get('DD_GROUP_TAG', 'default'),
+        'group_id': os.environ.get('DD_GROUP_ID', 'cidWuXsSf6NK/IyES4I61CAGw=='),
+        'bot_name': os.environ.get('DD_BOT_NAME', ''),
+        'webhook_url': os.environ.get('DD_WEBHOOK_URL', ''),
+        'webhook_secret': os.environ.get('DD_WEBHOOK_SECRET', ''),
+    }]
+
+GROUPS = _load_groups()
+
+# 兼容：保留 GROUP_ID 供日志和其他地方引用（取第一个群）
+GROUP_ID = GROUPS[0]['group_id'] if GROUPS else ''
+
+# 自己的 openDingTalkId（黎之），用于过滤自己发的消息
+MY_ID = os.environ.get('DD_MY_ID', 'D8xogtFABiSSTrd6EuHJzT9wLSbrcuEtTW')
+
+# 自己的钉钉显示名，用于检测 @我
+MY_NAME = os.environ.get('DD_MY_NAME', '黎之')
+
+# 兜底联系人：搜不到答案时 @这些人（逗号分隔，如 "黎之,燕麦"）
+FALLBACK_CONTACTS = os.environ.get('DD_FALLBACK_CONTACTS', '黎之').split(',')
+
+# 轮询间隔（秒）
+INTERVAL = int(os.environ.get('DD_INTERVAL', '15'))
+
+# DWS 二进制路径
+DWS_BIN = os.path.expanduser('~/.qoderwork/bin/ext/dws-core-darwin-arm64')
+
+# QMind 配置
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_LOCAL_QMIND = os.path.join(_APP_DIR, 'bin', 'qmind')
+_HOME_QMIND = os.path.expanduser('~/.qoderwork/skills/qmind-knowledge/bin/qmind')
+QMIND_BIN = _LOCAL_QMIND if os.path.isfile(_LOCAL_QMIND) else _HOME_QMIND
+NOTEBOOK_ID = '019f6f3e-3c97-7aea-af67-2a8ad6332343'
+
+# 状态持久化（多群共享一个状态文件）
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = os.path.join(_SCRIPT_DIR, '.dd_bot_state.json')
+PID_FILE = os.path.join(_SCRIPT_DIR, '.dd_bot.pid')
+
+# 已知机器人名称（过滤机器人回复，只保留真人提问）
+KNOWN_BOTS = {'AI小钉', '大荔枝', '小助手'}
+
+# 触发关键词（消息包含任一关键词才触发回答）
+TRIGGER_KEYWORDS = [
+    # 退改签核心场景
+    '退票', '退款', '退钱', '改签', '改期', '签转', '升舱', '降舱',
+    '航变', '航班取消', '航班延误', '延误', '取消', '备降', '返航',
+    '自愿', '非自愿', '病退', '死亡退', '重复购票', '错购',
+    '手续费', '退票费', '改签费', '差价', '罚金',
+    '盾冬', '方案', 'SOP', 'sop', '规则', '政策', '标准',
+    # 航司相关
+    '航司', '航空公司', '国航', '东航', '南航', '海航', '厦航', '川航',
+    '春秋', '吉祥', '深航', '山航', '首都航空', '中联航',
+    # 通用疑问
+    '怎么退', '怎么改', '如何退', '如何改', '为什么',
+    '什么时候', '多久', '几天', '多少钱',
+    '流程', '条件', '限制', '规定',
+    # 工单/客服
+    '工单', '投诉', '小二', '客服',
+    # 触发词
+    '大荔枝',
+    # 通用问号
+    '？', '?',
+]
+
+
+# ==================== 工具函数 ====================
+
+def load_state():
+    """加载持久化状态（已回复消息ID + 上次拉取时间）"""
+    if os.path.isfile(STATE_FILE):
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    return None
+
+
+def save_state(state):
+    with open(STATE_FILE, 'w') as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def log(msg):
+    ts = datetime.now().strftime('%H:%M:%S')
+    print(f'[{ts}] {msg}', flush=True)
+
+
+# ==================== DWS 命令 ====================
+
+def dws_chat(args):
+    """运行 dws chat 命令并返回 JSON"""
+    cmd = [DWS_BIN, 'chat'] + args + ['--format', 'json']
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            return None, r.stderr.strip()
+        data = json.loads(r.stdout)
+        return data, None
+    except subprocess.TimeoutExpired:
+        return None, 'timeout'
+    except Exception as e:
+        return None, str(e)
+
+
+def pull_messages(group_id, since_time, limit=20):
+    """拉取群消息"""
+    data, err = dws_chat([
+        'message', 'list',
+        '--group', group_id,
+        '--time', since_time,
+        '--limit', str(limit),
+    ])
+    if err:
+        return [], None, err
+    result = data.get('result', {})
+    messages = result.get('messages', [])
+    has_more = result.get('hasMore', False)
+    next_cursor = result.get('nextCursor')
+    return messages, next_cursor, None
+
+
+def send_as_user(group_id, text):
+    """以当前用户身份发送消息（自动转换 markdown 为纯文本）"""
+    text = clean_markdown(text)
+    data, err = dws_chat([
+        'message', 'send',
+        '--group', group_id,
+        '--text', text,
+    ])
+    if err:
+        return False, err
+    return True, None
+
+
+# ==================== Webhook 发送 ====================
+
+def _webhook_sign(secret):
+    """生成钉钉 webhook 加签参数"""
+    if not secret:
+        return ''
+    timestamp = str(round(time.time() * 1000))
+    string_to_sign = f'{timestamp}\n{secret}'
+    hmac_code = hmac.new(
+        secret.encode('utf-8'),
+        string_to_sign.encode('utf-8'),
+        digestmod=hashlib.sha256,
+    ).digest()
+    sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
+    return f'&timestamp={timestamp}&sign={sign}'
+
+
+def send_via_webhook(url, secret, text):
+    """通过 webhook 机器人发送 markdown 消息"""
+    full_url = url + _webhook_sign(secret)
+    payload = json.dumps({
+        'msgtype': 'markdown',
+        'markdown': {
+            'title': '大荔枝',
+            'text': text,
+        },
+    }).encode('utf-8')
+    req = urllib.request.Request(
+        full_url, data=payload,
+        headers={'Content-Type': 'application/json'},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+            if result.get('errcode') == 0:
+                return True, None
+            return False, result.get('errmsg', 'unknown error')
+    except Exception as e:
+        return False, str(e)
+
+
+def send_reply(group_cfg, text):
+    """发送回复（优先 webhook，fallback 到用户身份）"""
+    wh_url = group_cfg.get('webhook_url', '')
+    wh_secret = group_cfg.get('webhook_secret', '')
+    if wh_url:
+        ok, err = send_via_webhook(wh_url, wh_secret, text)
+        if ok:
+            return True, None
+        log(f'  Webhook 发送失败 ({err})，降级为用户身份发送')
+    return send_as_user(group_cfg['group_id'], text)
+
+
+# ==================== QMind RAG ====================
+
+def run_qmind(args, timeout=60):
+    cmd = [QMIND_BIN] + args
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0:
+            return None, r.stderr.strip()
+        return r.stdout.strip(), None
+    except subprocess.TimeoutExpired:
+        return None, 'timeout'
+    except Exception as e:
+        return None, str(e)
+
+
+_RAG_SYSTEM = (
+    '你是一位专业的国内机票客服知识助手。请按以下结构回答：\n'
+    '先给出结论（1-2句核心答案），\n'
+    '然后分点列出关键信息要点（用 **加粗** 标注关键词如航司、票种、费用金额等）。\n'
+    '控制在 300 字以内，保留必要的操作细节和条件，避免啰嗦重复。\n'
+    '如果问题缺少关键条件（如自愿/非自愿、航司、是否航变、票种等），'
+    '无法给出精确答案时，请在回答最前面加上 [NEED_MORE_INFO] 标记，'
+    '然后用简短友好的语气追问 1-2 个最关键的条件，帮助提问者缩小范围。'
+    '如果条件足够就直接回答，不要追问。'
+)
+
+
+def rag_answer(question, extra_context=''):
+    """调用 QMind RAG 生成回答，支持追问模式"""
+    full_q = question
+    if extra_context:
+        full_q = f'背景信息：{extra_context}\n问题：{question}'
+    prompt = f'{_RAG_SYSTEM}\n\n{full_q}'
+    out, err = run_qmind([
+        'rag', '-nb', NOTEBOOK_ID,
+        '-q', prompt, '-format', 'text',
+    ], timeout=120)
+    if err:
+        return None, None, err
+    # 检测是否需要追问
+    need_more = False
+    if out and out.strip().startswith('[NEED_MORE_INFO]'):
+        need_more = True
+        out = out.strip().replace('[NEED_MORE_INFO]', '', 1).strip()
+    return out, need_more, None
+
+
+def retrieve_sources(question):
+    """获取参考来源"""
+    out, err = run_qmind([
+        'retrieve', '-nb', NOTEBOOK_ID,
+        '-q', question, '-format', 'json',
+    ])
+    if err:
+        return [], err
+    try:
+        data = json.loads(out)
+        chunks = data.get('chunks', [])
+        seen = {}
+        for c in chunks:
+            title = c.get('sourceTitle', '')
+            score = c.get('score', 0)
+            if title and title not in seen or (title in seen and score > seen[title]):
+                seen[title] = score
+        sources = sorted(seen.items(), key=lambda x: -x[1])[:3]
+        return sources, None
+    except Exception as e:
+        return [], str(e)
+
+
+# ==================== 消息过滤 ====================
+
+def is_mentioned(text, bot_name=''):
+    """检查消息是否 @了我或 @了机器人（兼容 @黎之 和 @翁家乐(黎之) 两种格式）"""
+    import re
+    if re.search(r'@\S*' + re.escape(MY_NAME), text):
+        return True
+    if bot_name and re.search(r'@\S*' + re.escape(bot_name), text):
+        return True
+    return False
+
+
+def is_question(text):
+    """判断消息是否包含触发关键词"""
+    return any(kw in text for kw in TRIGGER_KEYWORDS)
+
+
+def should_trigger(text, bot_name=''):
+    """触发条件：@我 + 包含关键词"""
+    if not is_mentioned(text, bot_name):
+        return False
+    if is_question(text):
+        return True
+    return False
+
+
+def is_bot_message(sender_name):
+    """判断是否是机器人发的消息"""
+    return sender_name in KNOWN_BOTS
+
+
+def is_no_result(answer, sources):
+    """判断 RAG 是否没有搜到有效答案"""
+    if not answer:
+        return True
+    if not sources:
+        return True
+    # 来源最高分低于阈值，说明匹配度很低
+    if sources and sources[0][1] < 0.3:
+        return True
+    # RAG 返回的典型无结果话术
+    no_result_phrases = [
+        '没有找到', '无法找到', '没有相关', '抱歉，我',
+        '未找到', '暂时没有', '不确定', '没有确切',
+    ]
+    for phrase in no_result_phrases:
+        if phrase in answer[:80]:
+            return True
+    return False
+
+
+def strip_mentions(text):
+    """去除消息中的 @人名，只保留实际问题内容"""
+    import re
+    # 去除 @xxx 格式（包括 @翁家乐(黎之) 这种带括号的）
+    text = re.sub(r'@\S+\([^)]*\)', '', text)  # @name(nickname)
+    text = re.sub(r'@\S+', '', text)            # @name
+    return text.strip()
+
+
+def clean_markdown(text):
+    """将 markdown 转换为钉钉友好的纯文本格式，保留结构层次"""
+    import re
+    # ## 标题 → 【标题】
+    text = re.sub(r'^##\s+(.+)$', r'【\1】', text, flags=re.MULTILINE)
+    text = re.sub(r'^#{3,6}\s+(.+)$', r'【\1】', text, flags=re.MULTILINE)
+    # **text** → text（保留文字）
+    text = re.sub(r'\*{1,3}(.+?)\*{1,3}', r'\1', text)
+    # 行首 * 或 - 列表 → •
+    text = re.sub(r'^\s*[*-]\s+', '• ', text, flags=re.MULTILINE)
+    # --- 分隔线 → ════
+    text = re.sub(r'^---+$', '════════════════', text, flags=re.MULTILINE)
+    # 压缩多余空行
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+def format_reply(sender_name, answer, sources, is_empty):
+    """格式化回复：结论 + 正文 + 分隔线 + 来源"""
+    if is_empty:
+        fallback = ' '.join(f'@{c}' for c in FALLBACK_CONTACTS)
+        return (
+            f'@{sender_name}\n\n'
+            f'💡 抱歉，这个问题我暂时没有找到对应的知识~\n'
+            f'可以咨询 {fallback} 获取帮助。'
+        )
+    else:
+        parts = [f'@{sender_name}', '', '## 结论', '', clean_markdown(answer)]
+        if sources:
+            parts.append('')
+            parts.append('---')
+            parts.append('')
+            src_lines = ['📎 参考来源：']
+            for i, (title, score) in enumerate(sources, 1):
+                src_lines.append(f'{i}. {title}（{score*100:.0f}%）')
+            parts.append('\n'.join(src_lines))
+        return '\n'.join(parts)
+
+
+# ==================== 进程锁 ====================
+
+def _is_pid_alive(pid):
+    """检查进程是否存活"""
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def acquire_lock():
+    """获取进程锁，确保同一群只有一个实例在跑。
+    如果已有实例在跑则退出；如果旧进程已死则自动接管。"""
+    import fcntl
+
+    lock_file = PID_FILE + '.lock'
+    fd = open(lock_file, 'w')
+
+    # 尝试加排他锁（非阻塞）
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        # 有另一个实例持有锁，读取它的 PID
+        try:
+            with open(PID_FILE) as f:
+                old_pid = int(f.read().strip())
+            if _is_pid_alive(old_pid):
+                print(f'[锁冲突] PID {old_pid} 正在运行，退出', flush=True)
+                fd.close()
+                sys.exit(0)
+        except (ValueError, FileNotFoundError):
+            pass
+        # 旧进程已死但锁文件残留，强制接管
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+    # 锁成功，写入当前 PID
+    fd.write(str(os.getpid()))
+    fd.flush()
+    # 保留 fd 引用，防止被 GC 回收导致锁释放
+    acquire_lock._lock_fd = fd
+
+
+# ==================== 追问模式 ====================
+
+# 追问状态：{sender_id: {'original_q': str, 'followup_q': str, 'ts': float, 'turn': int}}
+_pending_followups = {}
+_FOLLOWUP_TIMEOUT = 300  # 追问有效期 5 分钟
+
+
+def _check_followup(sender_id, msg_text):
+    """检查消息是否是追问的回复。返回 (original_q, followup_q, reply_text) 或 None。"""
+    if sender_id not in _pending_followups:
+        return None
+    state = _pending_followups[sender_id]
+    if time.time() - state['ts'] > _FOLLOWUP_TIMEOUT:
+        del _pending_followups[sender_id]
+        return None
+    return state
+
+
+def _set_followup(sender_id, original_q, followup_q, turn=1):
+    """记录追问状态"""
+    _pending_followups[sender_id] = {
+        'original_q': original_q,
+        'followup_q': followup_q,
+        'ts': time.time(),
+        'turn': turn,
+    }
+
+
+def _clear_followup(sender_id):
+    """清除追问状态"""
+    _pending_followups.pop(sender_id, None)
+
+
+# ==================== 消息处理（线程安全） ====================
+
+_answered_lock = threading.Lock()
+
+
+def handle_message(msg, group_cfg):
+    """在独立线程中处理一条消息。返回 msg_id（已处理）或 None（跳过）。"""
+    msg_id = msg.get('openMessageId', '')
+    sender_id = msg.get('senderOpenDingTalkId', '')
+    sender_name = msg.get('sender', 'unknown')
+    content = msg.get('content', '')
+    bot_name = group_cfg.get('bot_name', '')
+
+    clean = content.strip()
+
+    # 跳过自己发的机器人回复
+    if sender_id == MY_ID and clean.startswith('[') and ']' in clean[:20]:
+        return msg_id
+
+    # 跳过机器人消息
+    if is_bot_message(sender_name):
+        return msg_id
+
+    # 跳过太短的消息
+    if len(clean) < 4:
+        return msg_id
+
+    # ---- 追问模式 ----
+    # 如果消息明确 @了其他机器人（非我们），不视为追问回复
+    other_bots = [b for b in KNOWN_BOTS if b != bot_name and b != '大荔枝']
+    mentions_other = any(f'@{b}' in clean for b in other_bots)
+
+    fu_state = _check_followup(sender_id, clean)
+    is_followup_reply = fu_state is not None and not should_trigger(clean, bot_name) and not mentions_other
+
+    if mentions_other and fu_state is not None:
+        # 用户在跟别的机器人说话，清除追问状态
+        _clear_followup(sender_id)
+
+    # 跳过不包含 @我+关键词 且不是追问回复的消息
+    if not should_trigger(clean, bot_name) and not is_followup_reply:
+        return msg_id
+
+    # ---- 处理问题 ----
+    question = strip_mentions(clean)[:500]
+
+    if is_followup_reply:
+        # 追问回复
+        extra = f"原问题：{fu_state['original_q']}\n你的追问：{fu_state['followup_q']}\n用户回答：{question}"
+        log(f'[{sender_name}] 追问回复: {question[:60]}')
+        t0 = time.time()
+        answer, need_more, aerr = rag_answer(question, extra_context=extra)
+        _clear_followup(sender_id)
+
+        if aerr or not answer:
+            # 追问回答失败，静默跳过（不发兜底消息，避免误回）
+            log(f'  追问回答失败，静默跳过: {aerr}')
+            return msg_id
+        elif need_more:
+            _set_followup(sender_id, fu_state['original_q'], answer, turn=fu_state['turn']+1)
+            reply = f'@{sender_name}\n\n{clean_markdown(answer)}'
+            log(f'  继续追问 (第{fu_state["turn"]+1}轮)')
+        else:
+            sources, _ = retrieve_sources(question)
+            empty = is_no_result(answer, sources)
+            if empty:
+                # 追问回答无有效结果，静默跳过
+                log(f'  追问无有效结果，静默跳过')
+                return msg_id
+            reply = format_reply(sender_name, answer, sources, is_empty=False)
+            elapsed = time.time() - t0
+            log(f'  追问回答成功 ({elapsed:.1f}s)')
+    else:
+        # 新问题
+        log(f'[{sender_name}] {question[:80]}{"..." if len(question) > 80 else ""}')
+        t0 = time.time()
+        answer, need_more, aerr = rag_answer(question)
+
+        if aerr or not answer:
+            reply = format_reply(sender_name, None, [], is_empty=True)
+            log(f'  回答失败: {aerr}')
+        elif need_more:
+            _set_followup(sender_id, question, answer)
+            reply = f'@{sender_name}\n\n{clean_markdown(answer)}'
+            log(f'  条件不足，已追问')
+        else:
+            sources, _ = retrieve_sources(question)
+            empty = is_no_result(answer, sources)
+            reply = format_reply(sender_name, answer, sources, is_empty=empty)
+            if empty:
+                log(f'  未搜到有效结果，已兜底')
+            else:
+                elapsed = time.time() - t0
+                log(f'  回答成功 ({elapsed:.1f}s)')
+
+    # 发送回复
+    ok, serr = send_reply(group_cfg, reply)
+    if ok:
+        log(f'  已发送')
+    else:
+        log(f'  发送失败: {serr}')
+
+    return msg_id
+
+
+# ==================== 主循环 ====================
+
+def main():
+    acquire_lock()
+
+    # 写入 PID 文件供 watchdog 检测
+    with open(PID_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+
+    log('=' * 50)
+    log('大荔枝 - 钉钉群机器人（多群模式）')
+    for g in GROUPS:
+        tag = g.get('tag', g['group_id'][:8])
+        wh = 'webhook' if g.get('webhook_url') else '用户身份'
+        log(f'  [{tag}] {g["group_id"][:20]}... ({wh})')
+    log(f'触发:    @{MY_NAME} + 关键词')
+    log(f'间隔:    {INTERVAL}s × {len(GROUPS)}群')
+    log(f'QMind:   {QMIND_BIN}')
+    log('=' * 50)
+
+    # 加载状态（per-group）
+    state = load_state() or {}
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    group_states = {}  # group_id -> {last_time, answered}
+    for g in GROUPS:
+        gid = g['group_id']
+        gs = state.get(gid)
+        if gs:
+            group_states[gid] = {
+                'last_time': gs.get('last_time', now_str),
+                'answered': set(gs.get('answered_ids', [])),
+            }
+            log(f'[{g.get("tag","")}] 恢复: 上次 {gs.get("last_time","?")}, 已回复 {len(gs.get("answered_ids",[]))} 条')
+        else:
+            group_states[gid] = {'last_time': now_str, 'answered': set()}
+            log(f'[{g.get("tag","")}] 首次监听')
+
+    consecutive_errors = {g['group_id']: 0 for g in GROUPS}
+    executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix='handler')
+    pending = {}  # future -> (msg_id, group_id)
+
+    def _collect_done():
+        """回收已完成的 future，更新对应群的 answered set。"""
+        for fut in list(pending):
+            if fut.done():
+                try:
+                    result_id = fut.result()
+                    if result_id:
+                        gid = pending[fut][1]
+                        with _answered_lock:
+                            group_states[gid]['answered'].add(result_id)
+                except Exception as e:
+                    log(f'  处理异常: {e}')
+                del pending[fut]
+
+    try:
+        while True:
+            try:
+                # 先回收已完成的任务
+                _collect_done()
+
+                # 轮询每个群
+                for g in GROUPS:
+                    gid = g['group_id']
+                    tag = g.get('tag', gid[:8])
+                    gs = group_states[gid]
+                    last_time = gs['last_time']
+                    answered = gs['answered']
+                    bot_name = g.get('bot_name', '')
+
+                    messages, next_cursor, err = pull_messages(gid, last_time, limit=10)
+                    if err:
+                        consecutive_errors[gid] += 1
+                        if consecutive_errors[gid] <= 2:
+                            log(f'[{tag}] 拉取失败: {err}')
+                        if consecutive_errors[gid] >= 5:
+                            log(f'[{tag}] 连续错误 {consecutive_errors[gid]}，跳过本轮')
+                        continue
+
+                    consecutive_errors[gid] = 0
+                    if not messages:
+                        continue
+
+                    log(f'[{tag}] 拉取到 {len(messages)} 条消息 (since {last_time})')
+
+                    for msg in messages:
+                        msg_id = msg.get('openMessageId', '')
+
+                        # 跳过已处理的消息
+                        with _answered_lock:
+                            if msg_id in answered:
+                                continue
+
+                        # 快速过滤
+                        clean = msg.get('content', '').strip()
+                        sender_id = msg.get('senderOpenDingTalkId', '')
+                        sender_name = msg.get('sender', 'unknown')
+
+                        skip = False
+                        if sender_id == MY_ID and clean.startswith('[') and ']' in clean[:20]:
+                            skip = True
+                        elif is_bot_message(sender_name):
+                            skip = True
+                        elif len(clean) < 4:
+                            skip = True
+                        elif not should_trigger(clean, bot_name) and _check_followup(sender_id, clean) is None:
+                            skip = True
+
+                        if skip:
+                            with _answered_lock:
+                                answered.add(msg_id)
+                            continue
+
+                        # 提交到线程池处理（先标记已处理，防止下轮重复提交）
+                        with _answered_lock:
+                            answered.add(msg_id)
+                        fut = executor.submit(handle_message, msg, g)
+                        pending[fut] = (msg_id, gid)
+
+                    # 更新该群的时间戳
+                    new_last_time = messages[-1].get('createTime', last_time)
+                    if new_last_time == last_time:
+                        from datetime import datetime as _dt, timedelta as _td
+                        try:
+                            dt = _dt.strptime(new_last_time, '%Y-%m-%d %H:%M:%S') + _td(seconds=1)
+                            gs['last_time'] = dt.strftime('%Y-%m-%d %H:%M:%S')
+                        except Exception:
+                            gs['last_time'] = new_last_time
+                    else:
+                        gs['last_time'] = new_last_time
+
+                # 持久化所有群的状态
+                save_data = {}
+                for g in GROUPS:
+                    gid = g['group_id']
+                    gs = group_states[gid]
+                    ans = gs['answered']
+                    if len(ans) > 500:
+                        gs['answered'] = set(list(ans)[-300:])
+                    save_data[gid] = {
+                        'last_time': gs['last_time'],
+                        'answered_ids': list(gs['answered']),
+                    }
+                save_state(save_data)
+
+                time.sleep(INTERVAL)
+
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                log(f'主循环异常: {e}')
+                import traceback
+                traceback.print_exc()
+                time.sleep(INTERVAL)
+
+    except KeyboardInterrupt:
+        log('收到退出信号，正在等待任务完成...')
+        executor.shutdown(wait=True, cancel_futures=False)
+        # 最终持久化
+        save_data = {}
+        for g in GROUPS:
+            gid = g['group_id']
+            gs = group_states[gid]
+            save_data[gid] = {
+                'last_time': gs['last_time'],
+                'answered_ids': list(gs['answered']),
+            }
+        save_state(save_data)
+        if os.path.isfile(PID_FILE):
+            os.remove(PID_FILE)
+        log('已保存，再见~')
+
+
+if __name__ == '__main__':
+    main()
