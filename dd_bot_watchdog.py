@@ -34,6 +34,7 @@ GROUPS = [
         'group_id': 'cidWuXsSf6NK/IyES4I61CAGw==',
         'bot_name': '转人工率推送',
         'bot_aliases': ['与时（海底捞版）'],
+        'reply_to_bots': ['与时'],  # 允许回应DEAP与时agent的消息
         'profile': 'haidilao',
         'notebook_id': '019fefa1-d4ab-75af-8950-7c69d310682a',
         'webhook_url': 'https://oapi.dingtalk.com/robot/send?access_token=754d6d615403a77721eac8b91240dda159827ea583bfaebdf604695bd3023c8e',

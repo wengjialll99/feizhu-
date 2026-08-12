@@ -591,8 +591,9 @@ def handle_message(msg, group_cfg):
     if sender_id == MY_ID and clean.startswith('[') and ']' in clean[:20]:
         return msg_id
 
-    # 跳过机器人消息
-    if is_bot_message(sender_name):
+    # 跳过机器人消息（reply_to_bots 中的 bot 除外）
+    reply_to_bots = group_cfg.get('reply_to_bots', [])
+    if is_bot_message(sender_name) and sender_name not in reply_to_bots:
         return msg_id
 
     # 跳过太短的消息
@@ -794,7 +795,7 @@ def main():
                         skip = False
                         if sender_id == MY_ID and clean.startswith('[') and ']' in clean[:20]:
                             skip = True
-                        elif is_bot_message(sender_name):
+                        elif is_bot_message(sender_name) and sender_name not in g.get('reply_to_bots', []):
                             skip = True
                         elif len(clean) < 4:
                             skip = True
