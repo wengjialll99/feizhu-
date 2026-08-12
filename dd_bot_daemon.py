@@ -612,8 +612,11 @@ def handle_message(msg, group_cfg):
         # 用户在跟别的机器人说话，清除追问状态
         _clear_followup(sender_id)
 
-    # 跳过不包含 @我+关键词 且不是追问回复的消息
-    if not should_trigger(clean, bot_name, g_trigger_keywords, g_trigger_any, g_aliases) and not is_followup_reply:
+    # reply_to_bots 中的 bot 发的消息直接触发，不需要 @
+    is_from_allowed_bot = sender_name in reply_to_bots
+
+    # 跳过不包含 @我+关键词 且不是追问回复 且不是允许的bot消息
+    if not should_trigger(clean, bot_name, g_trigger_keywords, g_trigger_any, g_aliases) and not is_followup_reply and not is_from_allowed_bot:
         return msg_id
 
     # ---- 处理问题 ----
@@ -799,7 +802,7 @@ def main():
                             skip = True
                         elif len(clean) < 4:
                             skip = True
-                        elif not should_trigger(clean, bot_name, _trig_kws, _trig_any, _aliases) and _check_followup(sender_id, clean) is None:
+                        elif not should_trigger(clean, bot_name, _trig_kws, _trig_any, _aliases) and _check_followup(sender_id, clean) is None and sender_name not in g.get('reply_to_bots', []):
                             skip = True
 
                         if skip:
