@@ -770,7 +770,7 @@ def main():
                     _trig_any = g.get('trigger_any') or _prof.get('trigger_any', False)
                     _aliases = g.get('bot_aliases', [])
 
-                    messages, next_cursor, err = pull_messages(gid, last_time, limit=50)
+                    messages, next_cursor, err = pull_messages(gid, last_time, limit=200)
                     if err:
                         consecutive_errors[tag] += 1
                         if consecutive_errors[tag] <= 2:
