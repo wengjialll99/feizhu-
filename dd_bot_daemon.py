@@ -428,21 +428,22 @@ def clean_markdown(text):
     return text.strip()
 
 
-def format_reply(sender_name, answer, sources, is_empty, casual=False):
-    """格式化回复。casual=True 时用聊天风格，不加结论/来源。"""
+def format_reply(sender_name, answer, sources, is_empty, casual=False, no_mention=False):
+    """格式化回复。casual=True 时用聊天风格，不加结论/来源。no_mention=True 时不@对方。"""
+    mention = '' if no_mention else f'@{sender_name}\n\n'
     if is_empty:
         if casual:
-            return f'@{sender_name}\n\n这个问题我还真不太清楚哈哈，你直接问当事人吧'
+            return f'{mention}这个问题我还真不太清楚哈哈，你直接问当事人吧'
         fallback = ' '.join(f'@{c}' for c in FALLBACK_CONTACTS)
         return (
-            f'@{sender_name}\n\n'
+            f'{mention}'
             f'💡 抱歉，这个问题我暂时没有找到对应的知识~\n'
             f'可以咨询 {fallback} 获取帮助。'
         )
     elif casual:
-        return f'@{sender_name}\n\n{clean_markdown(answer)}'
+        return f'{mention}{clean_markdown(answer)}'
     else:
-        parts = [f'@{sender_name}', '', '## 结论', '', clean_markdown(answer)]
+        parts = [mention.rstrip(), '', '## 结论', '', clean_markdown(answer)]
         if sources:
             parts.append('')
             parts.append('---')
@@ -637,7 +638,8 @@ def handle_message(msg, group_cfg):
             return msg_id
         elif need_more:
             _set_followup(sender_id, fu_state['original_q'], answer, turn=fu_state['turn']+1)
-            reply = f'@{sender_name}\n\n{clean_markdown(answer)}'
+            prefix = '' if is_from_allowed_bot else f'@{sender_name}\n\n'
+            reply = f'{prefix}{clean_markdown(answer)}'
             log(f'  继续追问 (第{fu_state["turn"]+1}轮)')
         else:
             sources, _ = retrieve_sources(question, notebook_id=g_notebook_id)
@@ -646,7 +648,7 @@ def handle_message(msg, group_cfg):
                 # 追问回答无有效结果，静默跳过
                 log(f'  追问无有效结果，静默跳过')
                 return msg_id
-            reply = format_reply(sender_name, answer, sources, is_empty=False, casual=g_casual)
+            reply = format_reply(sender_name, answer, sources, is_empty=False, casual=g_casual, no_mention=is_from_allowed_bot)
             elapsed = time.time() - t0
             log(f'  追问回答成功 ({elapsed:.1f}s)')
     else:
@@ -662,17 +664,18 @@ def handle_message(msg, group_cfg):
                                              notebook_id=g_notebook_id, system_prompt=g_system_prompt)
 
         if aerr or not answer:
-            reply = format_reply(sender_name, None, [], is_empty=True, casual=g_casual)
+            reply = format_reply(sender_name, None, [], is_empty=True, casual=g_casual, no_mention=is_from_allowed_bot)
             log(f'  回答失败: {aerr}')
         elif need_more:
             _set_followup(sender_id, question, answer)
-            reply = f'@{sender_name}\n\n{clean_markdown(answer)}'
+            prefix = '' if is_from_allowed_bot else f'@{sender_name}\n\n'
+            reply = f'{prefix}{clean_markdown(answer)}'
             log(f'  条件不足，已追问')
             _add_history(sender_id, question, answer)
         else:
             sources, _ = retrieve_sources(question, notebook_id=g_notebook_id)
             empty = False if g_casual else is_no_result(answer, sources)
-            reply = format_reply(sender_name, answer, sources, is_empty=empty, casual=g_casual)
+            reply = format_reply(sender_name, answer, sources, is_empty=empty, casual=g_casual, no_mention=is_from_allowed_bot)
             if empty:
                 log(f'  未搜到有效结果，已兜底')
             else:
