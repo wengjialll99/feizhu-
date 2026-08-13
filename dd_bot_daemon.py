@@ -121,9 +121,9 @@ HAIDILAO_KEYWORDS = [
 
 # ---- 预设档案：群配置可用 profile 字段引用 ----
 
-# 表情包配置（casual 模式下消息太长时只回表情包）
+# 表情包配置（casual 模式下遇到疑问句就回表情包）
 _STICKER_QIANGYAN = '![强颜欢笑](https://raw.githubusercontent.com/wengjialll99/feizhu-/main/stickers/qiangyanhuanxiao.png)'
-_STICKER_LONG_MSG_THRESHOLD = 80  # 消息超过这个长度就回表情包
+_STICKER_QUESTION_PATTERNS = ['？', '?', '吗', '呢', '吧', '怎么', '为什么', '是不是', '难道']
 
 PROFILES = {
     'haidilao': {
@@ -628,10 +628,10 @@ def handle_message(msg, group_cfg):
     # ---- 处理问题 ----
     question = strip_mentions(clean)[:500]
 
-    # 表情包回复：casual 模式下消息太长就只回表情包
-    if g_casual and len(question) > _STICKER_LONG_MSG_THRESHOLD:
+    # 表情包回复：casual 模式下遇到疑问句就只回表情包
+    if g_casual and any(p in question for p in _STICKER_QUESTION_PATTERNS):
         reply = _STICKER_QIANGYAN
-        log(f'[{sender_name}] 消息太长({len(question)}字)，回表情包')
+        log(f'[{sender_name}] 疑问句，回表情包')
         ok, serr = send_reply(group_cfg, reply)
         if ok:
             log(f'  已发送')
