@@ -276,7 +276,7 @@ def send_sticker_via_webhook(url, secret, image_url, title='表情包'):
         'msgtype': 'link',
         'link': {
             'title': title,
-            'text': '强颜欢笑',
+            'text': '与时：强颜欢笑',
             'picUrl': image_url,
             'messageUrl': image_url,
         },
