@@ -126,7 +126,7 @@ HAIDILAO_KEYWORDS = [
 # ---- 预设档案：群配置可用 profile 字段引用 ----
 
 # 表情包配置（模型输出 [STICKER] 时发送）
-_STICKER_QIANGYAN = '![强颜欢笑](https://raw.githubusercontent.com/wengjialll99/feizhu-/main/stickers/qiangyanhuanxiao.png?v=2)'
+_STICKER_URL = 'https://raw.githubusercontent.com/wengjialll99/feizhu-/main/stickers/qiangyanhuanxiao.png?v=3'
 
 PROFILES = {
     'haidilao': {
@@ -253,6 +253,32 @@ def send_via_webhook(url, secret, text, title='大荔枝'):
         'markdown': {
             'title': title,
             'text': text,
+        },
+    }).encode('utf-8')
+    req = urllib.request.Request(
+        full_url, data=payload,
+        headers={'Content-Type': 'application/json'},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+            if result.get('errcode') == 0:
+                return True, None
+            return False, result.get('errmsg', 'unknown error')
+    except Exception as e:
+        return False, str(e)
+
+
+def send_sticker_via_webhook(url, secret, image_url, title='表情包'):
+    """通过 webhook 发送表情包缩略图（link 类型，不会撑满屏幕）"""
+    full_url = url + _webhook_sign(secret)
+    payload = json.dumps({
+        'msgtype': 'link',
+        'link': {
+            'title': title,
+            'text': ' ',
+            'picUrl': image_url,
+            'messageUrl': image_url,
         },
     }).encode('utf-8')
     req = urllib.request.Request(
@@ -671,11 +697,15 @@ def handle_message(msg, group_cfg):
         answer, need_more, aerr = rag_answer(question, extra_context=extra,
                                              notebook_id=g_notebook_id, system_prompt=g_system_prompt)
 
-        # 模型输出 [STICKER] 时发表情包
+        # 模型输出 [STICKER] 时发表情包（用 link 类型，不会撑满屏幕）
         if answer and '[STICKER]' in answer:
-            reply = _STICKER_QIANGYAN
             log(f'[{sender_name}] 模型决定回表情包')
-            ok, serr = send_reply(group_cfg, reply)
+            wh_url = group_cfg.get('webhook_url', '')
+            wh_secret = group_cfg.get('webhook_secret', '')
+            if wh_url:
+                ok, serr = send_sticker_via_webhook(wh_url, wh_secret, _STICKER_URL, title='强颜欢笑')
+            else:
+                ok, serr = send_as_user(group_cfg['group_id'], f'![强颜欢笑]({_STICKER_URL})')
             if ok:
                 log(f'  已发送')
             else:
