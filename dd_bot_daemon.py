@@ -697,15 +697,11 @@ def handle_message(msg, group_cfg):
         answer, need_more, aerr = rag_answer(question, extra_context=extra,
                                              notebook_id=g_notebook_id, system_prompt=g_system_prompt)
 
-        # 模型输出 [STICKER] 时发表情包（用 link 类型，不会撑满屏幕）
+        # 模型输出 [STICKER] 时发表情包
         if answer and '[STICKER]' in answer:
+            reply = f'![强颜欢笑]({_STICKER_URL})'
             log(f'[{sender_name}] 模型决定回表情包')
-            wh_url = group_cfg.get('webhook_url', '')
-            wh_secret = group_cfg.get('webhook_secret', '')
-            if wh_url:
-                ok, serr = send_sticker_via_webhook(wh_url, wh_secret, _STICKER_URL, title='强颜欢笑')
-            else:
-                ok, serr = send_as_user(group_cfg['group_id'], f'![强颜欢笑]({_STICKER_URL})')
+            ok, serr = send_reply(group_cfg, reply)
             if ok:
                 log(f'  已发送')
             else:
