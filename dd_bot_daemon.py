@@ -106,7 +106,11 @@ _HAIDILAO_SYSTEM = (
     '## 对白感觉\n'
     '问：照片一模一样怎么解释？→ 兄弟，摆盘重复很正常哈，牛肉面我都能连吃一个月[偷笑]\n'
     '问：你就说是不是旧图！→ 一件很简单的事你自己太敏感了，我为什么要自证呢跟个木偶一样\n'
-    '问：19:30拍的18:57就发了？→ ……（已读不回）'
+    '问：19:30拍的18:57就发了？→ ……（已读不回）\n\n'
+    '## 表情包规则\n'
+    '如果用户的问题你回答不上来、或者问题很无语、很无聊、纯粹在调侃你，'
+    '就只回复三个字：[STICKER]（不要加任何其他内容）。'
+    '能正常回答的问题就正常回答，不要滥用。'
 )
 
 HAIDILAO_KEYWORDS = [
@@ -121,9 +125,8 @@ HAIDILAO_KEYWORDS = [
 
 # ---- 预设档案：群配置可用 profile 字段引用 ----
 
-# 表情包配置（casual 模式下遇到疑问句就回表情包）
+# 表情包配置（模型输出 [STICKER] 时发送）
 _STICKER_QIANGYAN = '![强颜欢笑](https://raw.githubusercontent.com/wengjialll99/feizhu-/main/stickers/qiangyanhuanxiao.png)'
-_STICKER_QUESTION_PATTERNS = ['？', '?', '吗', '呢', '吧', '怎么', '为什么', '是不是', '难道']
 
 PROFILES = {
     'haidilao': {
@@ -628,17 +631,6 @@ def handle_message(msg, group_cfg):
     # ---- 处理问题 ----
     question = strip_mentions(clean)[:500]
 
-    # 表情包回复：casual 模式下遇到疑问句就只回表情包
-    if g_casual and any(p in question for p in _STICKER_QUESTION_PATTERNS):
-        reply = _STICKER_QIANGYAN
-        log(f'[{sender_name}] 疑问句，回表情包')
-        ok, serr = send_reply(group_cfg, reply)
-        if ok:
-            log(f'  已发送')
-        else:
-            log(f'  发送失败: {serr}')
-        return msg_id
-
     if is_followup_reply:
         # 追问回复
         extra = f"原问题：{fu_state['original_q']}\n你的追问：{fu_state['followup_q']}\n用户回答：{question}"
@@ -678,6 +670,17 @@ def handle_message(msg, group_cfg):
 
         answer, need_more, aerr = rag_answer(question, extra_context=extra,
                                              notebook_id=g_notebook_id, system_prompt=g_system_prompt)
+
+        # 模型输出 [STICKER] 时发表情包
+        if answer and '[STICKER]' in answer:
+            reply = _STICKER_QIANGYAN
+            log(f'[{sender_name}] 模型决定回表情包')
+            ok, serr = send_reply(group_cfg, reply)
+            if ok:
+                log(f'  已发送')
+            else:
+                log(f'  发送失败: {serr}')
+            return msg_id
 
         if aerr or not answer:
             reply = format_reply(sender_name, None, [], is_empty=True, casual=g_casual, no_mention=is_from_allowed_bot)
