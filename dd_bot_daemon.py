@@ -126,7 +126,7 @@ HAIDILAO_KEYWORDS = [
 # ---- 预设档案：群配置可用 profile 字段引用 ----
 
 # 表情包配置（模型输出 [STICKER] 时发送）
-_STICKER_QIANGYAN = '![强颜欢笑](https://raw.githubusercontent.com/wengjialll99/feizhu-/main/stickers/qiangyanhuanxiao.png)'
+_STICKER_QIANGYAN = '![强颜欢笑](https://raw.githubusercontent.com/wengjialll99/feizhu-/main/stickers/qiangyanhuanxiao.png?v=2)'
 
 PROFILES = {
     'haidilao': {
